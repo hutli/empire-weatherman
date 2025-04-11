@@ -281,7 +281,7 @@ def post_to_discord(
         httpx.get(f"{TTS_URL}/api/manuscript/{article_id}")
 
         # Construct embed
-        summary = ""  # summarize(url)
+        summary = summarize(url)
         embed = {
             "type": "rich",
             "title": title,
