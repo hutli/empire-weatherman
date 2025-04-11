@@ -1,0 +1,15 @@
+version: "3"
+
+services:
+  empire-weatherman:
+    build: .
+    image: empire-weatherman
+    stdin_open: true
+    tty: true
+    restart: "unless-stopped"
+    volumes:
+      - ./state/:/app/state/
+    environment:
+      SEASONS: '["385YE_Summer", "385YE_Autumn", "385YE_Winter", "386YE_Spring", "386YE_Summer", "386YE_Autumn", "386YE_Winter"]'
+      TTS_SEASON_JSON_DIR: "/app/tts/"
+      ARTICLES_JSON: "/app/state/articles.json"
