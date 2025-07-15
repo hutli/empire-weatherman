@@ -10,6 +10,8 @@ services:
     volumes:
       - ./state/:/app/state/
     environment:
-      SEASONS: '["385YE_Summer", "385YE_Autumn", "385YE_Winter", "386YE_Spring", "386YE_Summer", "386YE_Autumn", "386YE_Winter"]'
+      SEASONS: '[["Recent_history", "mw-content-text"]]'
       TTS_SEASON_JSON_DIR: "/app/tts/"
       ARTICLES_JSON: "/app/state/articles.json"
+      SUMMARIZE: "True"
+      OPENAI_API_MODEL: "gpt-4.1"

@@ -1,9 +1,9 @@
-FROM python:3.12
+FROM python:3.13-rc-slim
 WORKDIR /app/
 
 # install binaries - ffmpeg (or avconv) needed by pydub (to be fast)
-RUN apt-get update --fix-missing
-RUN apt-get install ffmpeg -y
+RUN apt-get update -y
+RUN apt-get install ffmpeg gcc cargo -y
 
 COPY ./.env /app/src/
 COPY ./requirements.txt /app/

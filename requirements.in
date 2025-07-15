@@ -1,10 +1,12 @@
+audioop-lts
 beautifulsoup4
 httpx
 loguru
 mutagen
 mypy
+pydantic
 pydub
 pydub-stubs
 python-dotenv
+tqdm-loggable
 types-beautifulsoup4
-typing-extensions<4.4.0
