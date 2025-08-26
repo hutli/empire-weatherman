@@ -10,3 +10,4 @@ pydub-stubs
 python-dotenv
 tqdm-loggable
 types-beautifulsoup4
+websockets

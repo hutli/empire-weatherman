@@ -1,6 +1,8 @@
+import atexit
 import datetime
 import io
 import json
+import multiprocessing
 import os
 import pathlib
 import re
@@ -10,10 +12,12 @@ import bs4
 import dotenv
 import httpx
 import loguru
+import multiprocessing.sharedctypes
 import mutagen.mp3
 import pydantic
 import pydub
 import tqdm_loggable.auto  # type: ignore
+import websockets.sync.client
 
 
 class Article(pydantic.BaseModel):
@@ -34,7 +38,8 @@ DISCORD_HEADERS = {
     "Authorization": f"Bot {DISCORD_API_TOKEN}",
     "Content-Type": "application/json",
 }
-DISCORD_BANNED_GUILDS: list[str] = []
+DISCORD_BANNED_GUILDS: list[str] = []  # ["1015714452445864048"]
+DISCORD_DMS: list[str] = json.loads(os.environ["DISCORD_DMS"])
 DISCORD_MAX_UPLOAD_SIZE: int = 8_388_608  # 8 MiB
 
 WIKI_URL = "https://www.profounddecisions.co.uk"
@@ -50,11 +55,12 @@ TMP_FORCE_ADD_SEASON = ""
 SEASON_RE = re.compile(r"Category:\d{3}YE_(Spring|Summer|Autumn|Winter)")
 RECENT_HISTORY = "Category:Recent_History"
 ARTICLES_JSON = pathlib.Path(os.environ["ARTICLES_JSON"])
+USERS_JSON = pathlib.Path(os.environ["USERS_JSON"])
 TTS_SEASON_JSON_DIR = pathlib.Path(os.environ["TTS_SEASON_JSON_DIR"])
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_MAX_TOKENS = 10_000
 OPENAI_API_MODEL = os.environ["OPENAI_API_MODEL"]
-SUMMARIZE = os.getenv("SUMMARIZE")
+IO_SUMMARY_CHANNELS = os.getenv("IO_SUMMARY_CHANNELS")
 HEADER_REGEX = re.compile(r"^h[0-9]{1}$")
 NEWLINE = "\n"
 MENTIONS = [
@@ -64,11 +70,12 @@ MENTIONS = [
     {"search": "Bloodcrow Rasp", "mention": "<@289762927718957056>"},
     {"search": "Bloodcrow Udoo", "mention": "<@234781274546372610>"},
     {"search": "Gralka", "mention": "<@279953529991593986>"},
+    {"search": "Protectorate Kardak", "mention": "<@111124276140072960>"},
     {"search": "Rykana", "mention": "<@279700839533379585>"},
     {"search": "Weigher of Worth", "mention": "<@423209028529815562>"},
-    {"search": "Winds of War", "mention": "<@728023074527772733>"},
-    {"search": "Winds of War", "mention": "<@279700839533379585>"},
     {"search": "Winds of War", "mention": "<@214070708676984833>"},
+    {"search": "Winds of War", "mention": "<@279700839533379585>"},
+    {"search": "Winds of War", "mention": "<@728023074527772733>"},
 ]
 BANNERS = [
     "Ashborn",
@@ -96,6 +103,7 @@ The Empire is surrounded by barbarian nations nearly all being slaving nations a
  - The Grendel to the south are slavers currently at war with the Empire
  - The Druj to the east are slavers currently at war with the Empire
  - The Thule to the north have recently given up slavery and is in a tenious alliance with the Empire
+ - There are several individual territories around the empire infected with the Vallorn which is a malignant hostile ecosystem made of spring magic infecting all living things within it. You will often hear the Vallorn spoken about like another hostile Barbarian nation but the Vallorn has no will or goals apart from spreading.
 
 The Imperial Orcs are the previous slaves of the Empire. They freed themselves through a bloody slave-rebellion over 60 years ago.
 The nations of the Empire have 1 senator per territory, all making up the senate; the most powerful institution in the Empire.
@@ -103,6 +111,9 @@ All nations have multiple territories and therefore multiple senators with the I
 The Imperial Orcs are one of the 10 nations that make up the Empire.
 The Imperial Orcs have three armies the first legion "Winter Sun" and the second legion "Summer Storm" and the newest army the "Autumn Hammers".
 The Imperial Orcs consists of the following banners: {", ".join(BANNERS)}.
+The Imperial Orcs are made up of 6 septs: Ethengraw, Illarawm, Sannite, Sunstorm, Tamazi and Yerende. Septs are unique orc cultures and many septs exists outside the Imperial Orcs.
+
+The Imperial Orcs have recently also claimed the name "Unshackled" as a nation as a few orcs have started joining other nations within the Empire making "Imperial Orcs" a bit confusing. These are groups like the League Orcs which now call themselves the Unbroken or the Marcher orcs, previously the Mourn orcs.
 
 Now, for your task. The following is an article describing a recent development in the Empire. We are ONLY interested in information DIRECTLY relevant to the Imperial Orc nation (no indirect relevancy). Please write a summary in less than 150 words containing ONLY information relevant to the Imperial Orc nation. If there is no information directly relevant for the Imperial Orc nation please only respond with "There is no new information relevant to the Imperial Orc nation in this article." and do not write a summary nor explain why.
 
@@ -158,7 +169,7 @@ def summarize(url: str) -> str | None:
             },
             json={
                 "model": OPENAI_API_MODEL,
-                "temperature": 0.2,
+                # "temperature": 0.2,
                 # "max_tokens": 8192,
                 "messages": [{"role": "user", "content": CHATGPT_INTRO + text}],
             },
@@ -186,7 +197,7 @@ def summarize(url: str) -> str | None:
                 result = f'Could not summarize article "{url}": "content" in "message" in choice 1 in response is not string: "{resp_json}"'
                 loguru.logger.error(result)
                 return result
-
+            loguru.logger.info(f'Successfully summarized article "{url}"')
             return result
         else:
             try:
@@ -199,8 +210,6 @@ def summarize(url: str) -> str | None:
                 elif resp.json()["error"]["code"] == "context_length_exceeded":
                     return "Article too long for AI to summarise... Sorry"
                 elif resp.json()["error"]["code"] == "insufficient_quota":
-                    return None  # TODO: Pay for more quota when you have money
-
                     loguru.logger.warning(
                         "Insufficient OpenAI Quota for summarization - retrying in 1 hour."
                     )
@@ -307,19 +316,14 @@ def post_to_discord(
         httpx.get(f"{TTS_URL}/api/manuscript/{article_id}")
 
         # Construct embed
-        summary = summarize(url) if SUMMARIZE else None
-        embed = {
+        summary = summarize(url) if IO_SUMMARY_CHANNELS else None
+        embed: dict = {
             "type": "rich",
             "title": title,
             "description": description,
             "url": url,
             "fields": [],
             "timestamp": str(datetime.datetime.now(datetime.UTC)),
-            "footer": {
-                "text": (f"IO SUMMARY: {summary}\n\n" if summary else "")
-                + (f"RELEVANT FOR: {relevancy}\n\n" if relevancy else "")
-                + "Uploaded",
-            },
         }
         if img:
             embed["image"] = {"url": img}
@@ -357,7 +361,6 @@ def post_to_discord(
             ],
         }
 
-        guilds_posted_to: list = []
         r = httpx.get(
             DISCORD_API_ENDPOINT + "/users/@me/guilds", headers=DISCORD_HEADERS
         )
@@ -370,141 +373,186 @@ def post_to_discord(
             loguru.logger.warning("Bot not added to any guilds!")
             return False
 
+        channels = []
         for guild in my_guilds:
             if "id" in guild and guild["id"] not in DISCORD_BANNED_GUILDS:
                 while True:
-                    guilds_r = httpx.get(
+                    r = httpx.get(
                         f"{DISCORD_API_ENDPOINT}/guilds/{guild['id']}/channels",
                         headers=DISCORD_HEADERS,
                     )
-                    if guilds_r.is_success:
+                    if r.is_success:
+                        for channel in r.json():
+                            if channel["name"] == DISCORD_POSTING_CHANNEL_NAME:
+                                channel["guild_name"] = guild["name"]
+                                channels.append(channel)
+                                break
                         break
                     else:
                         timeout = 10
-                        if guilds_r.status_code == 429:
-                            timeout = guilds_r.json()["retry_after"] / 1000
+                        if r.status_code == 429:
+                            timeout = r.json()["retry_after"] / 1000
                             loguru.logger.warning(
-                                f"Too many requests to Discord, waiting {timeout} seconds: {guilds_r} | {guilds_r.text}"
+                                f"Too many requests to Discord, waiting {timeout} seconds: {r} | {r.text}"
                             )
                         else:
                             loguru.logger.warning(
-                                f"Could not get discord guilds, waiting 10 seconds: {guilds_r} | {guilds_r.text}"
+                                f"Could not get discord guilds, waiting 10 seconds: {r} | {r.text}"
                             )
                         time.sleep(timeout)
-                for channel in guilds_r.json():
-                    if channel["name"] == DISCORD_POSTING_CHANNEL_NAME:
-                        # Wait for TTS audio
-                        for i in range(RETRIES):
-                            while True:
-                                r = httpx.get(f"{TTS_URL}/api/manuscript/{article_id}")
-                                if r.is_success:
-                                    break
-                                else:
-                                    loguru.logger.warning(
-                                        f"Error getting manuscript, retrying in 1 min: {r} | {r.text}"
-                                    )
-                                    time.sleep(60)
-                            if r.is_error:
-                                loguru.logger.warning(
-                                    f'"{article_id}" API error "{r}", retrying in 10 min ({i+1}/{RETRIES} retries)'
-                                )
-                            if r.json()["state"] == "disallowed":
-                                loguru.logger.warning(
-                                    f'TTS for "{article_id}" disallowed - skipping audio download'
-                                )
-                                break
-                            if r.json()["state"] != "done":
-                                loguru.logger.info(
-                                    f'"{article_id}" not done ({r.json()["state"]}), retrying in 10 min ({i+1}/{RETRIES} retries)'
-                                )
-                            elif "complete_audio_url" not in r.json():
-                                loguru.logger.info(
-                                    f'No complete audio URL in "{article_id}", retrying in 10 min ({i+1}/{RETRIES} retries)'
-                                )
-                            else:
-                                # Download audio
-                                complete_audio_url = (
-                                    f'{TTS_URL}{r.json()["complete_audio_url"]}'
-                                )
 
-                                audio_data = httpx.get(complete_audio_url).content
-                                audio_datas = split_audio(audio_data)
+        for u in json.load(open(USERS_JSON)).values():
+            channels += [
+                httpx.get(
+                    DISCORD_API_ENDPOINT + f"/channels/{c}", headers=DISCORD_HEADERS
+                ).json()
+                for c in u["channels"]
+            ]
 
-                                if len(audio_datas) > 1:
-                                    loguru.logger.warning(
-                                        f"Audio file too large ({sizeof_fmt(len(audio_data))}) splitting into {len(audio_datas)} files"
-                                    )
+        channels_posted_to: list = []
+        for channel in channels:
+            channel_identifier = channel["id"]
+            if "guild_name" in channel and channel["guild_name"]:
+                channel_identifier = f"{channel["guild_name"]} (Guild)"
+            elif "recipients" in channel and channel["recipients"]:
+                channel_identifier = (
+                    ", ".join(r["username"] for r in channel["recipients"])
+                    + " (Direct message)"
+                )
 
-                                json_body["attachments"] = upload_audios(
-                                    title, channel["id"], audio_datas
-                                )
-                                break
+            # Wait for TTS audio
+            for i in range(RETRIES):
+                while True:
+                    r = httpx.get(f"{TTS_URL}/api/manuscript/{article_id}")
+                    if r.is_success:
+                        break
+                    else:
+                        loguru.logger.warning(
+                            f"Error getting manuscript, retrying in 1 min: {r} | {r.text}"
+                        )
+                        time.sleep(60)
+                if r.is_error:
+                    loguru.logger.warning(
+                        f'"{article_id}" API error "{r}", retrying in 10 min ({i+1}/{RETRIES} retries)'
+                    )
+                manuscript = r.json()
+                if (
+                    manuscript["state"] == "disallowed"
+                    or manuscript["state"] == "error"
+                ):
+                    loguru.logger.warning(
+                        f'TTS for "{article_id}" {manuscript["state"]} - skipping audio download'
+                    )
+                    break
+                if manuscript["state"] != "done":
+                    loguru.logger.info(
+                        f'"{article_id}" not done ({manuscript["state"]}), retrying in 10 min ({i+1}/{RETRIES} retries)'
+                    )
+                elif "complete_audio_url" not in manuscript:
+                    loguru.logger.info(
+                        f'No complete audio URL in "{article_id}", retrying in 10 min ({i+1}/{RETRIES} retries)'
+                    )
+                else:
+                    # Download audio
+                    complete_audio_url = f'{TTS_URL}{r.json()["complete_audio_url"]}'
 
-                            time.sleep(10 * 60)
+                    audio_data = httpx.get(complete_audio_url).content
+                    audio_datas = split_audio(audio_data)
 
-                        # Send message
-                        while True:
-                            try:
-                                r = httpx.post(
-                                    f"{DISCORD_API_ENDPOINT}/channels/{channel['id']}/messages",
-                                    headers=DISCORD_HEADERS,
-                                    json=json_body,
-                                )
-                                break
-                            except httpx.ReadTimeout as e:
-                                loguru.logger.warning(
-                                    f"Error while posting to Discord, retrying in 10s: {e}"
-                                )
-                                time.sleep(10)
+                    if len(audio_datas) > 1:
+                        loguru.logger.warning(
+                            f"Audio file too large ({sizeof_fmt(len(audio_data))}) splitting into {len(audio_datas)} files"
+                        )
 
-                        if r.is_success:
-                            message = r.json()
-                            while True:
-                                try:
-                                    r = httpx.post(
-                                        f"{DISCORD_API_ENDPOINT}/channels/{channel['id']}/messages/{message['id']}/threads",
-                                        headers=DISCORD_HEADERS,
-                                        json={
-                                            "name": title,
-                                            "auto_archive_duration": 1440,
-                                        },
-                                    )
-                                    break
-                                except httpx.ReadTimeout:
-                                    loguru.logger.warning(
-                                        f"Could not create message thread, retrying in 10s"
-                                    )
-                                    time.sleep(10)
+                    json_body["attachments"] = upload_audios(
+                        title, channel["id"], audio_datas
+                    )
+                    break
 
-                            if r.is_success:
-                                thread = r.json()
-                                r = httpx.post(
-                                    f"{DISCORD_API_ENDPOINT}/channels/{thread['id']}/messages",
-                                    headers=DISCORD_HEADERS,
-                                    json={
-                                        "content": f"**Please try to keep discussions in these threads.**"
-                                    },
-                                )
-                                if r.is_success:
-                                    guilds_posted_to.append(guild["name"])
-                                else:
-                                    loguru.logger.error(
-                                        f'"{title}" in guild "{guild["name"]}" - Could not post message to thread: {r} | {r.text}'
-                                    )
-                            else:
-                                loguru.logger.error(
-                                    f'"{title}" in guild "{guild["name"]}" - Could not create thread: {r} | {r.text}'
-                                )
-                        else:
-                            loguru.logger.error(
-                                f'"{title}" in guild "{guild["name"]}" - Could not post main message: {r} | {r.text}'
+                time.sleep(10 * 60)
+
+            footer = {
+                "text": (f"IO SUMMARY: {summary}\n\n" if summary else "")
+                + (f"RELEVANT FOR: {relevancy}\n\n" if relevancy else "")
+            }
+            if "created" in manuscript:
+                footer["text"] += "Created"
+                json_body["embeds"][0]["timestamp"] = manuscript["created"]
+            elif "lastmod" in manuscript:
+                footer["text"] += "Last modified"
+                json_body["embeds"][0]["timestamp"] = manuscript["lastmod"]
+            else:
+                footer["text"] += "Created (Estimated)"
+                loguru.logger.warning(
+                    f'No "created" or "lastmod" in manuscript - using detection time'
+                )
+
+            json_body["embeds"][0]["footer"] = footer
+
+            # Send message
+            while True:
+                try:
+                    r = httpx.post(
+                        f"{DISCORD_API_ENDPOINT}/channels/{channel['id']}/messages",
+                        headers=DISCORD_HEADERS,
+                        json=json_body,
+                    )
+                    break
+                except httpx.ReadTimeout as e:
+                    loguru.logger.warning(
+                        f"Error while posting to Discord, retrying in 10s: {e}"
+                    )
+                    time.sleep(10)
+
+            if r.is_success:
+                channels_posted_to.append(channel_identifier)
+                message = r.json()
+                if "guild_id" in channel:
+                    while True:
+                        try:
+                            r = httpx.post(
+                                f"{DISCORD_API_ENDPOINT}/channels/{channel['id']}/messages/{message['id']}/threads",
+                                headers=DISCORD_HEADERS,
+                                json={
+                                    "name": title,
+                                    "auto_archive_duration": 1440,
+                                },
                             )
-                            loguru.logger.error(json_body)
-        if guilds_posted_to:
+                            break
+                        except httpx.ReadTimeout:
+                            loguru.logger.warning(
+                                f"Could not create message thread, retrying in 10s"
+                            )
+                            time.sleep(10)
+
+                    if r.is_success:
+                        thread = r.json()
+                        r = httpx.post(
+                            f"{DISCORD_API_ENDPOINT}/channels/{thread['id']}/messages",
+                            headers=DISCORD_HEADERS,
+                            json={
+                                "content": f"**Please try to keep discussions in these threads.**"
+                            },
+                        )
+                        if not r.is_success:
+                            loguru.logger.error(
+                                f'"{title}" in guild "{channel_identifier}" - Could not post message to thread: {r} | {r.text}'
+                            )
+                    else:
+                        loguru.logger.error(
+                            f'"{title}" in guild "{channel_identifier}" - Could not create thread: {r} | {r.text}'
+                        )
+            else:
+                loguru.logger.error(
+                    f'"{title}" in guild "{channel_identifier}" - Could not post main message: {r} | {r.text}'
+                )
+                loguru.logger.error(json_body)
+
+        if channels_posted_to:
             loguru.logger.info(
-                f'Successfully posted "{title}" to {len(guilds_posted_to)} guilds ({", ".join( guilds_posted_to)})'
+                f'Successfully posted "{title}" to {len(channels_posted_to)} channels ({", ".join(f'"{c}"' for c in channels_posted_to)})'
             )
-        return not not guilds_posted_to
+        return not not channels_posted_to
     return False
 
 
@@ -581,12 +629,7 @@ def get_recent_history(skip_articles: list[str]) -> list[Article]:
         else:
             url = None
 
-    return [
-        Article(title=t, path=p, season=extract_season(p))
-        for t, p in tqdm_loggable.auto.tqdm(
-            pages, desc="Recent History - Extracting seasons"
-        )
-    ]
+    return [Article(title=t, path=p, season=extract_season(p)) for t, p in pages]
 
 
 def extract_wof_relevancy(season: str) -> dict[str, dict]:
@@ -761,9 +804,87 @@ def update_articles(
     return articles
 
 
+def update_users(terminate: multiprocessing.sharedctypes.Synchronized) -> None:
+    loguru.logger.info("User update process started")
+    users = json.load(open(USERS_JSON))
+    uri = f"wss://gateway.discord.gg/?v=8&encoding=json"
+    while not terminate.value:
+        try:
+            with websockets.sync.client.connect(uri) as websocket:
+                identify_event = {
+                    "op": 2,
+                    "d": {
+                        "token": DISCORD_API_TOKEN,
+                        "intents": 4096,  # Direct Messages
+                        "properties": {
+                            "$os": "linux",
+                            "$browser": "my_bot",
+                            "$device": "my_bot",
+                        },
+                        "presence": {
+                            "status": "online",
+                            "afk": False,
+                            "since": 91879201,
+                            "activities": [],
+                        },
+                    },
+                }
+
+                websocket.send(json.dumps(identify_event))
+
+                for message in websocket:
+                    if terminate.value:
+                        break
+                    message = json.loads(message)
+
+                    # Check if it's MESSAGE_CREATE event and that it's a DM
+                    if (
+                        "t" in message
+                        and message["t"] == "MESSAGE_CREATE"
+                        and (
+                            "guild_id" not in message["d"]
+                            or not message["d"]["guild_id"]
+                        )
+                    ):
+                        author = message["d"]["author"]
+                        if author["id"] not in users:
+                            loguru.logger.info(
+                                f'Found new user "{author["username"]} ({author["id"]})"'
+                            )
+                            users[author["id"]] = author
+
+                        if "channels" not in users[author["id"]]:
+                            users[author["id"]]["channels"] = []
+
+                        if (
+                            message["d"]["channel_id"]
+                            not in users[author["id"]]["channels"]
+                        ):
+                            users[author["id"]]["channels"].append(
+                                message["d"]["channel_id"]
+                            )
+                            loguru.logger.info(
+                                f'Found new channel "{message["d"]["channel_id"]} (DM: {author["username"]})"'
+                            )
+
+                    json.dump(users, open(USERS_JSON, "w"), indent=4)
+        except Exception as e:
+            loguru.logger.warning(
+                f"User update process encountered an error, restarting in 10s: {e}"
+            )
+            time.sleep(10)
+
+    loguru.logger.info("User update process ended")
+
+
+terminate_user_update = multiprocessing.Value("i", 0)
+user_update_process = multiprocessing.Process(
+    target=update_users, args=(terminate_user_update,)
+)
+user_update_process.start()
+
 loguru.logger.info("Empire Wiki Winds update process started")
 articles = [Article(**a) for a in json.load(open(ARTICLES_JSON))]
-
 while True:
     # if TMP_FORCE_ADD:
     #     if TMP_FORCE_ADD:
@@ -783,3 +904,15 @@ while True:
         articles = update_articles(new_articles, wof_relevancy)
 
     time.sleep(10 * 60)  # Check every 10 minutes
+
+
+def exit_handler():
+    global user_update_process, terminate_user_update
+    if user_update_process:
+        loguru.logger.info("Terminating user update process...")
+        terminate_user_update.value = 1
+        user_update_process.join()
+        loguru.logger.info("User update process stopped, exiting")
+
+
+atexit.register(exit_handler)
